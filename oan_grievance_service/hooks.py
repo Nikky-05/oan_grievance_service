@@ -37,6 +37,13 @@ permission_query_conditions = {
 
 has_permission = {
 	"Grievance": "oan_grievance_service.permissions.has_grievance_permission",
+	# Core's File resolves a private file's permission against whatever it is
+	# attached to, so this is what stops /private/files/<name> serving an unscanned
+	# object behind download()'s back.
+	"Grievance Attachment": (
+		"oan_grievance_service.grievance_management.doctype.grievance_attachment"
+		".grievance_attachment.has_permission"
+	),
 }
 
 # Document Events

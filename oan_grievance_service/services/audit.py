@@ -14,6 +14,10 @@ ACTION_VIEW_LIST = "view_list"
 ACTION_EXPORT = "export"
 ACTION_VIEW_ATTACHMENT = "view_attachment"
 ACTION_VIEW_SUBMITTER_IDENTITY = "view_submitter_identity"
+# The one write in a trail otherwise made of reads. Evidence leaving a case is
+# exactly what an auditor asking "what was this decided on" needs to see, and
+# recording it as a view -- which is what it was doing -- hides it among them.
+ACTION_DELETE_ATTACHMENT = "delete_attachment"
 
 
 def record_access(action, grievance=None, scope=None, decision="Allowed"):

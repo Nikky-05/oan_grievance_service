@@ -15,7 +15,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from oan_grievance_service.api.v1 import attachment
-from oan_grievance_service.services import scanning
+from oan_grievance_service.services import scanning, submission
 from oan_grievance_service.tests.fixtures import a_grievance
 
 WINDOWS_EXECUTABLE = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00"
@@ -189,6 +189,80 @@ class TestDownloadIsGatedOnTheScan(AttachmentAPITestCase):
 		self.assertEqual(result["status"], "error")
 
 
+class TestTheObjectIsNotReachableAroundTheGate(AttachmentAPITestCase):
+	"""The download endpoint is not the only way to a private file.
+
+	Core serves /private/files/<name> itself and decides permission by asking
+	whatever the File is attached to. While these files hung off the Grievance,
+	that question was "may you read the case" -- which an officer can -- so the
+	scan verdict was never consulted and download() guarded a door beside an open
+	window.
+	"""
+
+	def _uploaded(self):
+		result = self._send("receipt.jpg", _jpeg())
+		return result["data"]["attachment"]
+
+	def _file_of(self, name):
+		url = frappe.db.get_value("Grievance Attachment", name, "file_url")
+		return frappe.get_doc("File", frappe.db.get_value("File", {"file_url": url}, "name"))
+
+	def _as_officer(self):
+		"""Ask the question as someone the check actually applies to.
+
+		Administrator bypasses has_permission entirely, so asserting as Administrator
+		would pass whether the gate existed or not -- it would test nothing.
+		"""
+		email = "attachment.officer@example.com"
+		if frappe.db.exists("User", email):
+			frappe.delete_doc("User", email, force=True, ignore_permissions=True)
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": email,
+				"first_name": "Attachment Officer",
+				"send_welcome_email": 0,
+				"roles": [{"role": "Grievance Officer"}],
+			}
+		).insert(ignore_permissions=True)
+
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user(email)
+		return email
+
+	def test_the_file_hangs_off_the_attachment_not_the_case(self):
+		name = self._uploaded()
+		stored = self._file_of(name)
+
+		self.assertEqual(stored.attached_to_doctype, "Grievance Attachment")
+		self.assertEqual(stored.attached_to_name, name)
+
+	def test_core_refuses_to_serve_a_file_that_has_not_been_scanned(self):
+		name = self._uploaded()
+		self._as_officer()
+		self.assertFalse(frappe.has_permission("Grievance Attachment", "read", doc=name))
+
+	def test_core_serves_it_once_the_scan_is_clean(self):
+		name = self._uploaded()
+		frappe.db.set_value("Grievance Attachment", name, "scan_status", "Clean")
+		self._as_officer()
+
+		self.assertTrue(frappe.has_permission("Grievance Attachment", "read", doc=name))
+
+	def test_an_infected_file_stays_unreachable_by_the_direct_route(self):
+		name = self._uploaded()
+		frappe.db.set_value("Grievance Attachment", name, "scan_status", "Infected")
+		self._as_officer()
+
+		self.assertFalse(frappe.has_permission("Grievance Attachment", "read", doc=name))
+
+	def test_no_url_is_handed_back_at_upload_time(self):
+		"""Returning it was the other half of the leak: a client could hold the path
+		before anything had looked at the bytes."""
+		result = self._send("receipt.jpg", _jpeg())
+		self.assertNotIn("file_url", result["data"])
+
+
 class TestListing(AttachmentAPITestCase):
 	def test_every_attachment_is_listed_with_its_verdict(self):
 		self._send("one.jpg", _jpeg())
@@ -241,3 +315,191 @@ class TestDeletion(AttachmentAPITestCase):
 		result = attachment.delete(attachment=name)
 		self.assertEqual(result["status"], "error")
 		self.assertIn("Closed", result["message"])
+
+
+def a_draft(client_uuid="draft-uuid-0001"):
+	"""An open draft, the state the wizard is in before the case exists."""
+	return frappe.get_doc(
+		{
+			"doctype": "Grievance Draft",
+			"client_uuid": client_uuid,
+			"step_reached": 2,
+			"payload": '{"description": "still typing"}',
+		}
+	).insert(ignore_permissions=True)
+
+
+class DraftAttachmentTestCase(FrappeTestCase):
+	"""The wizard uploads before the Grievance exists.
+
+	Every test above goes through `grievance=`. This half of the endpoint was
+	shipped untested, which is how the draft path came to write a different set of
+	columns than the grievance path does.
+	"""
+
+	def setUp(self):
+		self.draft = a_draft()
+		self._saved_request = getattr(frappe.local, "request", None)
+
+	def tearDown(self):
+		frappe.local.request = self._saved_request
+		frappe.db.rollback()
+
+	def _send(self, filename, content, **kwargs):
+		frappe.local.request = _Request(_Upload(filename, content))
+		kwargs.setdefault("client_uuid", self.draft.client_uuid)
+		return attachment.submit_document(**kwargs)
+
+	def _rows(self):
+		return frappe.get_all(
+			"Grievance Attachment",
+			filters={"draft": self.draft.name},
+			fields=["name", "mime_type", "checksum_sha256", "document_type", "file_url", "scan_status"],
+		)
+
+
+class TestDraftUpload(DraftAttachmentTestCase):
+	def test_a_file_can_be_attached_to_an_open_draft(self):
+		result = self._send("receipt.jpg", _jpeg())
+		self.assertEqual(result["status"], "success")
+		self.assertEqual(len(self._rows()), 1)
+
+	def test_the_draft_row_records_the_sniffed_type(self):
+		"""Not left null to be guessed later: the bytes are only here once."""
+		self._send("receipt.jpg", _jpeg())
+		self.assertEqual(self._rows()[0]["mime_type"], "image/jpeg")
+
+	def test_the_draft_row_records_a_real_sha256(self):
+		"""Core's content_hash is MD5. A field named checksum_sha256 must not hold one."""
+		self._send("receipt.jpg", _jpeg())
+		digest = self._rows()[0]["checksum_sha256"]
+
+		self.assertEqual(len(digest), 64, "a SHA-256 digest is 64 hex characters")
+		int(digest, 16)
+
+	def test_the_document_type_survives(self):
+		self._send("receipt.jpg", _jpeg(), document_type="Receipt")
+		self.assertEqual(self._rows()[0]["document_type"], "Receipt")
+
+	def test_an_executable_renamed_to_jpg_is_refused_on_a_draft_too(self):
+		result = self._send("holiday.jpg", WINDOWS_EXECUTABLE)
+		self.assertEqual(result["status"], "error")
+
+	def test_coordinates_are_stripped_on_the_draft_path_too(self):
+		original = _jpeg(with_gps=True)
+		self.assertTrue(scanning.has_location_metadata(original))
+
+		self._send("field.jpg", original)
+		row = self._rows()[0]
+		file_name = frappe.db.get_value("File", {"file_url": row["file_url"]}, "name")
+		content = frappe.get_doc("File", file_name).get_content()
+		self.assertFalse(scanning.has_location_metadata(content))
+
+	def test_a_submitted_draft_takes_no_more_files(self):
+		grievance = a_grievance()
+		frappe.db.set_value("Grievance Draft", self.draft.name, "submitted_as", grievance.name)
+
+		result = self._send("late.jpg", _jpeg())
+		self.assertEqual(result["status"], "error")
+
+
+class TestDraftLimits(DraftAttachmentTestCase):
+	def test_a_draft_cannot_carry_more_than_the_cap(self):
+		"""Otherwise the cap is a suggestion: fill a draft, then submit it."""
+		for i in range(attachment.MAX_ATTACHMENTS_PER_CASE):
+			self._send(f"file{i}.jpg", _jpeg())
+
+		result = self._send("one-too-many.jpg", _jpeg())
+		self.assertEqual(result["status"], "error")
+
+
+class TestDraftBecomesGrievance(DraftAttachmentTestCase):
+	def test_the_files_move_to_the_case_with_their_metadata_intact(self):
+		"""The row is not rebuilt at submission -- rebuilding is what lost the type."""
+		self._send("receipt.jpg", _jpeg(), document_type="Receipt")
+		before = self._rows()[0]
+
+		grievance = a_grievance()
+		submission.attach_draft_files(self.draft.name, grievance.name)
+
+		moved = frappe.get_all(
+			"Grievance Attachment",
+			filters={"grievance": grievance.name},
+			fields=["mime_type", "checksum_sha256", "document_type", "draft"],
+		)
+		self.assertEqual(len(moved), 1)
+		self.assertEqual(moved[0]["mime_type"], before["mime_type"])
+		self.assertEqual(moved[0]["checksum_sha256"], before["checksum_sha256"])
+		self.assertEqual(moved[0]["document_type"], "Receipt")
+		self.assertFalse(moved[0]["draft"], "the draft link is cleared once the case owns it")
+
+	def test_moving_twice_does_not_duplicate_the_evidence(self):
+		self._send("receipt.jpg", _jpeg())
+		grievance = a_grievance()
+
+		submission.attach_draft_files(self.draft.name, grievance.name)
+		submission.attach_draft_files(self.draft.name, grievance.name)
+
+		rows = frappe.get_all("Grievance Attachment", filters={"grievance": grievance.name})
+		self.assertEqual(len(rows), 1)
+
+
+class TestAbandonedDraftsLeaveNothingBehind(DraftAttachmentTestCase):
+	def test_purging_a_draft_removes_its_files(self):
+		"""Frappe does not cascade File deletion, so an abandoned wizard would
+		otherwise leave its uploads on disk permanently."""
+		from oan_grievance_service.api.v1 import draft as draft_api
+
+		self._send("receipt.jpg", _jpeg())
+		file_url = self._rows()[0]["file_url"]
+		self.assertTrue(frappe.db.exists("File", {"file_url": file_url}))
+
+		frappe.db.set_value("Grievance Draft", self.draft.name, "expires_on", "2020-01-01 00:00:00")
+		draft_api.purge_expired_drafts()
+
+		self.assertFalse(frappe.db.exists("Grievance Draft", self.draft.name))
+		self.assertFalse(frappe.db.exists("File", {"file_url": file_url}))
+		self.assertFalse(frappe.db.exists("Grievance Attachment", {"draft": self.draft.name}))
+
+
+class TestAGuestCanAttachToTheirOwnDraft(DraftAttachmentTestCase):
+	"""The half of the wizard that was unreachable.
+
+	draft.save and draft.load are already open to a guest, because the wizard saves
+	progress before the submitter has registered. The upload was not, so a farmer
+	could describe their evidence and then be refused when attaching it.
+	"""
+
+	def test_a_guest_may_upload_against_a_draft(self):
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Guest")
+
+		result = self._send("receipt.jpg", _jpeg())
+		self.assertEqual(result["status"], "success")
+
+	def test_a_guest_may_not_upload_against_a_grievance(self):
+		"""The draft's client_uuid is the capability. A case has an owner instead."""
+		grievance = a_grievance()
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user("Guest")
+
+		frappe.local.request = _Request(_Upload("receipt.jpg", _jpeg()))
+		result = attachment.submit_document(grievance=grievance.name)
+		self.assertEqual(result["status"], "error")
+
+
+class TestTheTrailSaysWhatHappened(AttachmentAPITestCase):
+	def test_a_deletion_is_recorded_as_a_deletion(self):
+		"""It was being written as view_attachment, which files the one event an
+		auditor is looking for among the thousands they are not."""
+		from oan_grievance_service.services import audit
+
+		name = self._send("mistake.jpg", _jpeg())["data"]["attachment"]
+		attachment.delete(attachment=name)
+
+		actions = frappe.get_all(
+			"Grievance Access Audit Event",
+			filters={"grievance": self.grievance.name},
+			pluck="action",
+		)
+		self.assertIn(audit.ACTION_DELETE_ATTACHMENT, actions)

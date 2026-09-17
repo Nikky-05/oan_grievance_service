@@ -170,7 +170,10 @@ def strip_location_metadata(content: bytes, mime: str) -> bytes:
 	try:
 		source = Image.open(io.BytesIO(content))
 		clean = Image.new(source.mode, source.size)
-		clean.putdata(list(source.getdata()))
+		# paste() copies in C. putdata(list(getdata())) built a Python list of every
+		# pixel first, so a 12-megapixel photo -- well inside the 10 MB ceiling --
+		# cost hundreds of megabytes before a single byte was written.
+		clean.paste(source)
 
 		out = io.BytesIO()
 		clean.save(out, format=source.format)

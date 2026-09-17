@@ -126,8 +126,28 @@ def purge_expired_drafts():
 		pluck="name",
 	)
 	for name in stale:
+		_purge_draft_uploads(name)
 		frappe.delete_doc("Grievance Draft", name, ignore_permissions=True, delete_permanently=True)
 	return len(stale)
+
+
+def _purge_draft_uploads(draft):
+	"""Delete the evidence an abandoned wizard left behind.
+
+	Frappe does not cascade a File when the row it is attached to goes, so without
+	this every wizard someone closed halfway leaves its uploads on disk for good --
+	and they are private files nobody can now reach, which is the worst of both.
+	"""
+	rows = frappe.get_all(
+		"Grievance Attachment",
+		filters={"draft": draft},
+		fields=["name", "file_url"],
+	)
+	for row in rows:
+		file_name = frappe.db.get_value("File", {"file_url": row.file_url}, "name")
+		if file_name:
+			frappe.delete_doc("File", file_name, force=True, ignore_permissions=True)
+		frappe.delete_doc("Grievance Attachment", row.name, force=True, ignore_permissions=True)
 
 
 def _session_user():

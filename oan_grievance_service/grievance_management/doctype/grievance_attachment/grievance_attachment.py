@@ -33,10 +33,23 @@ SCAN_INFECTED = "Infected"
 
 class GrievanceAttachment(Document):
 	def validate(self):
+		self.validate_owner()
 		self.validate_uploader()
 		self.validate_size()
 		self.validate_type()
 		self.validate_response_belongs_to_grievance()
+
+	def validate_owner(self):
+		"""Evidence belongs to exactly one thing: a case, or the draft that becomes one.
+
+		Neither means an orphan nothing will ever purge; both means two owners
+		disagreeing about who the file belongs to once the draft is submitted.
+		"""
+		if bool(self.grievance) == bool(self.draft):
+			frappe.throw(
+				_("An attachment must belong to either a grievance or a draft, not both."),
+				title=_("Ambiguous Owner"),
+			)
 
 	def validate_uploader(self):
 		"""Every file is attributable to whoever put it there.
@@ -44,11 +57,20 @@ class GrievanceAttachment(Document):
 		FR-10 needs the trail to name a person for each piece of evidence, and an
 		attachment with no uploader is evidence nobody is answerable for.
 		"""
-		if not (self.uploaded_by_user or self.uploaded_by_submitter):
-			frappe.throw(
-				_("An attachment must record who uploaded it."),
-				title=_("Uploader Required"),
-			)
+		if self.uploaded_by_user or self.uploaded_by_submitter:
+			return
+
+		# A file uploaded from the wizard has no one to name yet: the submitter has
+		# not registered, which is the whole reason drafts are reachable without a
+		# token. The draft's client_uuid stands in until submission, and
+		# attach_draft_files stamps the owner the moment the case exists.
+		if self.draft:
+			return
+
+		frappe.throw(
+			_("An attachment must record who uploaded it."),
+			title=_("Uploader Required"),
+		)
 
 	def validate_size(self):
 		if self.size_bytes and self.size_bytes > MAX_SIZE_BYTES:
@@ -111,3 +133,26 @@ class GrievanceAttachment(Document):
 		audit trail stay either way.
 		"""
 		return self.scan_status == SCAN_CLEAN
+
+
+def has_permission(doc, ptype="read", user=None, debug=False):
+	"""Deny read on an attachment whose file has not been cleared.
+
+	Registered in hooks.py, and the reason is core's File: a private file resolves
+	its permission against whatever it is attached to (File.has_permission). While
+	these rows were attached to the Grievance, anyone who could read the case could
+	fetch /private/files/<name> directly and never touch download(), so the scan
+	gate guarded a door beside an open window.
+
+	Attaching the File to this row instead puts that native check here, where the
+	scan verdict lives. Listing is unaffected: get_attachments() reads with
+	ignore_permissions and applies its own case-level check, because an officer
+	does need to see that an infected file was submitted.
+	"""
+	if ptype not in ("read", "write", "delete"):
+		return True
+
+	if isinstance(doc, str):
+		doc = frappe.get_doc("Grievance Attachment", doc)
+
+	return bool(doc.is_servable())

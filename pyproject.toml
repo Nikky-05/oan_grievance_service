@@ -4,19 +4,27 @@ authors = [
     { name = "COSS - Centre for Open Societal Systems", email = "admin@openagrinet.org"}
 ]
 description = "OpenAgriNet Ethiopia Grievance Management Module: multi-channel grievance intake, routing, SLA tracking and escalation"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 readme = "README.md"
 dynamic = ["version"]
 dependencies = [
     # "frappe~=16.0.0" # Installed and managed by bench.
-    "PyJWT~=2.13.0",
-    "pydantic>=2.0",
+    # oan_auth_service is declared in hooks.py as required_apps, not here: bench
+    # installs a Frappe app from its repo, not from PyPI. PyJWT and pydantic are
+    # that app's own dependencies -- this one imports neither.
+    #
+    # Attachment pipeline. Both ship with Frappe today, but this module imports them
+    # directly and each guards a security boundary -- the magic-byte sniff and the
+    # EXIF strip fail open if the import disappears, so neither is left transitive.
+    "filetype>=1.2",
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pre-commit",
     "semgrep",
+    "pypdf>=4.0", # builds a valid PDF for the attachment upload tests
 ]
 
 [build-system]
@@ -34,7 +42,7 @@ packages = []
 
 [tool.ruff]
 line-length = 110
-target-version = "py310"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = [

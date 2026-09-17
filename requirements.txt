@@ -1,2 +1,10 @@
-PyJWT~=2.13.0
-pydantic>=2.0
+# Mirrors [project.dependencies] in pyproject.toml, which is what bench reads.
+# oan_auth_service is not listed here: it is a Frappe app, declared in hooks.py
+# as required_apps and installed from its repo rather than from PyPI. PyJWT and
+# pydantic belong to that app -- this one imports neither.
+
+# Attachment pipeline. Both ship with Frappe today, but this module imports them
+# directly and each guards a security boundary -- the magic-byte sniff and the
+# EXIF strip fail open if the import disappears, so neither is left transitive.
+filetype>=1.2
+Pillow>=10.0

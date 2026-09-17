@@ -98,60 +98,35 @@ def find_or_create_submitter(payload):
 
 
 def attach_draft_files(draft, grievance):
-	"""Move the files uploaded against a draft onto the grievance it became.
+	"""Hand the draft's evidence to the case it became.
 
-	Files are uploaded while the wizard is still open, before any Grievance row
-	exists, so they are parented to the draft and re-parented here. The File rows
-	are updated rather than copied: re-uploading would double the storage and
-	break any URL the client is already showing.
+	The attachment rows are re-pointed, not rebuilt. Rebuilding them is what lost
+	the metadata: the row was reconstructed from the File, which knows a name, a
+	size and an MD5 -- so `checksum_sha256` was filled with a hash that is not one,
+	`mime_type` came out null, and whatever the submitter had labelled the document
+	was dropped. The bytes are only in front of us once, at upload; everything
+	derived from them is recorded there and simply travels with the row.
 
-	Each file also gets a Grievance Attachment row. Frappe's File doctype stores
-	the object but carries none of what evidence needs -- a scan verdict, a
-	content hash, or a typed link to the case -- and a download gate has to read
-	those from somewhere.
+	The File objects do not move at all. They are attached to the attachment row,
+	which is what makes core's private-file permission check consult the scan
+	verdict, and that row keeps its name across the change of owner.
 	"""
-	files = frappe.get_all(
-		"File",
-		filters={"attached_to_doctype": "Grievance Draft", "attached_to_name": draft},
-		fields=["name", "file_name", "file_url", "file_size", "content_hash"],
+	rows = frappe.get_all(
+		"Grievance Attachment",
+		filters={"draft": draft},
+		fields=["name", "uploaded_by_user", "uploaded_by_submitter"],
 	)
-
 	submitter = frappe.db.get_value("Grievance", grievance, "submitter")
-	for f in files:
-		frappe.db.set_value(
-			"File",
-			f.name,
-			{"attached_to_doctype": "Grievance", "attached_to_name": grievance},
-			update_modified=False,
-		)
-		_record_attachment(grievance, f, submitter)
 
-	return len(files)
+	for row in rows:
+		values = {"grievance": grievance, "draft": None}
+		# A guest's upload carried no uploader, because there was no one to name.
+		# The case has an owner now, and FR-10 wants every file attributable.
+		if not (row.uploaded_by_user or row.uploaded_by_submitter):
+			values["uploaded_by_submitter"] = submitter
+		frappe.db.set_value("Grievance Attachment", row.name, values, update_modified=False)
 
-
-def _record_attachment(grievance, file_row, submitter):
-	"""Register one moved file as evidence on the case.
-
-	The MIME type is left for the upload endpoint to sniff and stamp; nothing here
-	trusts the extension. `scan_status` stays Pending, which is what withholds the
-	object until a scanner has looked at it.
-	"""
-	if frappe.db.exists("Grievance Attachment", {"grievance": grievance, "file_url": file_row.file_url}):
-		return
-
-	frappe.get_doc(
-		{
-			"doctype": "Grievance Attachment",
-			"grievance": grievance,
-			"file_name": file_row.file_name,
-			"file_url": file_row.file_url,
-			"size_bytes": file_row.file_size or 0,
-			"checksum_sha256": file_row.content_hash,
-			"uploaded_by_submitter": submitter,
-			"uploaded_by_user": None if submitter else frappe.session.user,
-			"scan_status": "Pending",
-		}
-	).insert(ignore_permissions=True)
+	return len(rows)
 
 
 def record_consent(doc):

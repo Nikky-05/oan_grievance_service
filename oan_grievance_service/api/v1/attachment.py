@@ -42,9 +42,8 @@ from .grievance import ALLOWED_GRIEVANCE_ROLES
 MAX_ATTACHMENTS_PER_CASE = 10
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True)  # nosemgrep: frappe-semgrep-rules.rules.security.guest-whitelisted-method
 @handle_api_errors
-@require_role(ALLOWED_GRIEVANCE_ROLES)
 def submit_document(
 	grievance: str | None = None,
 	client_uuid: str | None = None,
@@ -56,9 +55,12 @@ def submit_document(
 	The file arrives as multipart form data, which is how a browser sends a file
 	the submitter picked; nothing about it is trusted until the bytes are read.
 
-	Either `grievance` or `client_uuid` is required. The wizard sends `client_uuid`
-	because the case does not exist yet -- the file is parented to the draft and
-	re-parented at submission.
+	Guests reach the draft path only. A draft is already reachable without a token
+	-- the wizard saves progress before the submitter has registered -- and an
+	upload that cannot follow it there leaves a farmer able to describe their
+	evidence but not attach it. The draft's `client_uuid` is the capability, the
+	same one draft.load already trusts. The grievance path still requires a role,
+	because by then there is a case with an owner.
 	"""
 	if not (grievance or client_uuid):
 		frappe.throw(
@@ -75,61 +77,81 @@ def submit_document(
 	# recorded -- the client's claim never does.
 	mime = scanning.validate_upload(file_name, content)
 
+	owner = {}
 	if grievance:
+		_require_grievance_role()
 		case = _case_for_write(grievance)
-		_enforce_attachment_limit(case.name)
-		parent_doctype, parent_name = "Grievance", case.name
+		owner = {"grievance": case.name}
 		submitter = case.submitter
+		_enforce_attachment_limit(owner)
 	else:
-		draft = _draft_for_write(client_uuid)
-		parent_doctype, parent_name = "Grievance Draft", draft
+		owner = {"draft": _draft_for_write(client_uuid)}
 		submitter = None
+		_enforce_attachment_limit(owner)
 
 	# Re-encoded before storage, not after: the stripped copy is the only one that
 	# is ever written, so a crash between write and strip cannot leave coordinates
 	# on disk.
 	content = scanning.strip_location_metadata(content, mime)
 
+	# The File is created unattached and re-pointed once the row it belongs to has a
+	# name. It cannot be attached at insert because the attachment row needs the
+	# file_url the insert returns, and it must not stay unattached because core
+	# resolves a private file's permission through whatever it is attached to.
 	stored = frappe.get_doc(
 		{
 			"doctype": "File",
 			"file_name": file_name,
 			"content": content,
-			"attached_to_doctype": parent_doctype,
-			"attached_to_name": parent_name,
 			"is_private": 1,
 		}
 	).insert(ignore_permissions=True)
 
-	attachment = None
-	if grievance:
-		attachment = frappe.get_doc(
-			{
-				"doctype": "Grievance Attachment",
-				"grievance": parent_name,
-				"response": response,
-				"document_type": document_type,
-				"file_name": stored.file_name,
-				"file_url": stored.file_url,
-				"mime_type": mime,
-				"size_bytes": len(content),
-				"checksum_sha256": scanning.sha256_of(content),
-				"uploaded_by_submitter": submitter,
-				"uploaded_by_user": None if submitter else frappe.session.user,
-				"scan_status": SCAN_PENDING,
-			}
-		).insert(ignore_permissions=True)
-
-	return success_response(
-		data={
-			"attachment": attachment.name if attachment else None,
+	attachment = frappe.get_doc(
+		{
+			"doctype": "Grievance Attachment",
+			**owner,
+			"response": response,
+			"document_type": document_type,
 			"file_name": stored.file_name,
 			"file_url": stored.file_url,
 			"mime_type": mime,
 			"size_bytes": len(content),
-			# Pending is the honest answer and the client should show it: the file is
-			# stored but not yet servable. The hourly scan decides.
-			"scan_status": attachment.scan_status if attachment else SCAN_PENDING,
+			"checksum_sha256": scanning.sha256_of(content),
+			"uploaded_by_submitter": submitter,
+			"uploaded_by_user": None if submitter else _acting_user(),
+			"scan_status": SCAN_PENDING,
+		}
+	).insert(ignore_permissions=True)
+
+	frappe.db.set_value(
+		"File",
+		stored.name,
+		{"attached_to_doctype": "Grievance Attachment", "attached_to_name": attachment.name},
+		update_modified=False,
+	)
+
+	# Scanned on arrival rather than on the hour. The hourly job stays as the net
+	# that catches anything this enqueue dropped -- a worker restart, a scanner that
+	# was down at the moment of upload.
+	frappe.enqueue(
+		"oan_grievance_service.services.scanning.scan_attachment",
+		queue="short",
+		name=attachment.name,
+		enqueue_after_commit=True,
+	)
+
+	return success_response(
+		data={
+			"attachment": attachment.name,
+			"file_name": stored.file_name,
+			"mime_type": mime,
+			"size_bytes": len(content),
+			"checksum_sha256": attachment.checksum_sha256,
+			# Pending is the honest answer and the client should show it. No file_url
+			# is returned: until a scanner clears it there is nothing safe to point at,
+			# and download() is where that decision is made.
+			"scan_status": attachment.scan_status,
 		},
 		message=_("Document uploaded and queued for scanning"),
 	)
@@ -164,6 +186,11 @@ def get_attachments(grievance: str):
 			"creation",
 		],
 		order_by="creation asc",
+		# has_permission now denies read on anything not yet Clean, which is what
+		# closes the /private/files bypass. Listing has to step around it: an officer
+		# needs to see that an infected file was submitted and what became of it.
+		# The case-level check above is what authorises this read.
+		ignore_permissions=True,
 	)
 	for row in rows:
 		row["servable"] = row["scan_status"] == SCAN_CLEAN
@@ -233,7 +260,7 @@ def delete(attachment: str):
 		frappe.delete_doc("File", file_name, force=True, ignore_permissions=True)
 
 	frappe.delete_doc("Grievance Attachment", doc.name, force=True, ignore_permissions=True)
-	audit.record_access(audit.ACTION_VIEW_ATTACHMENT, grievance=case.name)
+	audit.record_access(audit.ACTION_DELETE_ATTACHMENT, grievance=case.name)
 
 	return success_response(data={"deleted": True}, message=_("Attachment removed"))
 
@@ -241,6 +268,26 @@ def delete(attachment: str):
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
+
+
+def _acting_user():
+	"""The signed-in user, or None for a guest filling in the wizard."""
+	user = frappe.session.user
+	return None if user in ("Guest", None) else user
+
+
+def _require_grievance_role():
+	"""The role check submit_document used to carry as a decorator.
+
+	Applied here instead so it covers the grievance path only: the draft path is
+	reachable by a guest, exactly as draft.save and draft.load already are.
+	"""
+	roles = set(frappe.get_roles(frappe.session.user))
+	if not roles & set(ALLOWED_GRIEVANCE_ROLES):
+		frappe.throw(
+			_("You do not have permission to attach documents to a grievance."),
+			frappe.PermissionError,
+		)
 
 
 def _uploaded_file():
@@ -302,8 +349,13 @@ def _draft_for_write(client_uuid):
 	return name
 
 
-def _enforce_attachment_limit(grievance):
-	count = frappe.db.count("Grievance Attachment", {"grievance": grievance})
+def _enforce_attachment_limit(owner):
+	"""The cap applies to a draft as well as a case.
+
+	Enforcing it only on the grievance path made it a suggestion: fill a draft with
+	a hundred files, submit it, and they all arrive at once.
+	"""
+	count = frappe.db.count("Grievance Attachment", owner)
 	if count >= MAX_ATTACHMENTS_PER_CASE:
 		frappe.throw(
 			_("A grievance may carry at most {0} attachments.").format(MAX_ATTACHMENTS_PER_CASE),

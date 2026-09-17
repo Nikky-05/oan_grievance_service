@@ -32,6 +32,10 @@ EXEMPT_PATHS: list[str] = [
 	"/api/method/oan_grievance_service.api.v1.draft.save",
 	"/api/method/oan_grievance_service.api.v1.draft.load",
 	"/api/method/oan_grievance_service.api.v1.draft.discard",
+	# Attaching to a draft is part of the same unauthenticated wizard. The endpoint
+	# gates the grievance path on a role itself; a guest reaches only the draft
+	# path, by holding its client_uuid.
+	"/api/method/oan_grievance_service.api.v1.attachment.submit_document",
 ]
 
 
